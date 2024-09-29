@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -112,16 +111,18 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         super(Net, self).__init__()
         nl, nh = args.n_layers, args.n_hiddens
         self.margin = args.memory_strength  # 设定记忆强度，即存储新数据的程度
+        #self.is_cifar = (args.data_file == 'cifar10.pt')  # 判断是否为cifar100数据集
         self.data_file = args.data_file
         self.is_cifar = (args.data_file == 'cifar100.pt' or args.data_file == "cifar10.pt" or "mini_imagenet" in args.data_file)
-        #self.is_cifar = (args.data_file == 'cifar10.pt')  # 判断是否为cifar100数据集
         self.mas_coef = mas_coef  # 添加新的超参数 mas_coef
         self.l2_coef = l2_coef
         self.state = {}  # 添加存储模型参数状态的字典
         if self.is_cifar:  # 如果是cifar100数据集
-            self.net = ResNet18(n_outputs,args.data_file)  # 神经网络为ResNet18    ********
+            #self.net = ResNet18(n_outputs)  # 神经网络为ResNet18    ********
+            self.net = ResNet18(n_outputs, args.data_file)  # 神经网络为ResNet18    ********
             self.target_layer = self.net.layer4[-1]  # 设定目标层，即最后一层
-            self.cam = GradCAM(model=self.net, target_layer=self.target_layer,use_cuda=True)  # 实例化GradCAM，使用cuda  **********
+            self.cam = GradCAM(model=self.net, target_layer=self.target_layer,
+                               use_cuda=True)  # 实例化GradCAM，使用cuda  **********
         else:  # 如果不是cifar100数据集
             self.net = MLP([n_inputs] + [nh] * nl + [n_outputs])  # 神经网络为MLP  ********
         #  以上为初始化神经网络所需运行的代码
@@ -178,43 +179,70 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         # for param in self.parameters():
         #     self.omega.append(torch.zeros_like(param.data, requires_grad=False))
         # self.prev_param = None
-        self.pt_output = None
-        # self.offset1 = None
-        # self.offset2 = None
-        self.pt_loss = None
 
 
+    def new_loss_function(self, x, t, y):
+        # Compute the output of the network
+        output = self.forward(x, t)
 
-
-    def update_parameters(self, x, t, y):
-
-        self.zero_grad()
+        # Compute the classification loss for the current task
         offset1, offset2 = compute_offsets(t, self.nc_per_task, self.is_cifar)
-        current_task_loss = self.ce(self.forward(x, t)[:, offset1:offset2], y - offset1)
-        loss_update = self.ce(self.net(x)[:, offset1:offset2], y - offset1)    #优化损失  适配损失suitabilityloss
+        current_task_loss = self.ce(output[:, offset1:offset2], y - offset1)
 
-        regularization_loss = 0 #任务记忆损失   task memory loss
-        dist_loss = 0  #任务分布对齐损失  alignment loss
-
-        # compute gradient on previous tasks      #  计算前一个任务的梯度
-        if len(self.observed_tasks) > 1:  # 代码首先判断模型已经观察到的任务数量是否大于1，如果是则进入for循环。
-
+        # Regularization term for retaining knowledge from previous tasks
+        if len(self.observed_tasks) > 1:
+            regularization_loss = 0
             for tt in range(len(self.observed_tasks) - 1):
                 past_task = self.observed_tasks[tt]
                 offset1, offset2 = compute_offsets(past_task, self.nc_per_task, self.is_cifar)
-                pt_output = self.forward(self.memory_data[past_task], past_task)[:, offset1:offset2]
+                pt_output = self.forward(self.memory_data[past_task], past_task)[:, offset1: offset2]
                 pt_loss = self.ce(pt_output, self.memory_labs[past_task] - offset1)
                 regularization_loss += pt_loss
-
-                #logits = pt_output
-                probs = F.softmax(pt_output, dim=1)
-                avg_probs = torch.mean(probs, dim=0)
-                uniform_dist = torch.ones_like(avg_probs) / (offset2 - offset1)
-                dist_loss += F.kl_div(torch.log(avg_probs), uniform_dist)
             regularization_loss /= (len(self.observed_tasks) - 1)
+        else:
+            regularization_loss = 0
 
-        total_loss = current_task_loss + 0.3 * regularization_loss + loss_update + dist_loss #
-        total_loss.backward()
+        # Total loss is the combination of the classification loss and the regularization loss
+        total_loss = current_task_loss + 0.3* regularization_loss   #self.mas_coef
+
+        return total_loss
+
+    def distribution_loss(self, t):
+        if t == 0:
+            return 0
+
+        observed_tasks = self.observed_tasks[:t]  # 已观察到的任务列表
+        #num_tasks = len(observed_tasks)
+        #task_prob = 1 / num_tasks  # 每个任务的概率
+
+        dist_loss = 0
+        for past_task in observed_tasks:
+            offset1, offset2 = compute_offsets(past_task, self.nc_per_task, self.is_cifar)
+            logits = self.forward(self.memory_data[past_task], past_task)[:, offset1:offset2]
+            probs = F.softmax(logits, dim=1)
+            avg_probs = torch.mean(probs, dim=0)
+            uniform_dist = torch.ones_like(avg_probs) /(offset2 - offset1)
+            dist_loss +=  F.kl_div(torch.log(avg_probs), uniform_dist)  #task_prob *
+
+        return dist_loss
+
+    def update_parameters(self, x, t, y):
+        self.zero_grad()
+        output = self.net(x)
+        offset1, offset2 = compute_offsets(t, self.nc_per_task, self.is_cifar)
+        loss = self.ce(output[:, offset1:offset2], y - offset1) +self.new_loss_function(x, t, y) + self.distribution_loss(t)
+
+        # loss +=  self.new_loss_function(x, t, y)
+        #
+        # loss += self.distribution_loss(t)
+
+        # if t > 0:
+        #     prev_output = self.forward(x, t - 1)
+        #     prev_offset1, prev_offset2 = compute_offsets(t - 1, self.nc_per_task, self.is_cifar)
+        #     regularization_loss = F.mse_loss(output[:, prev_offset1:prev_offset2],
+        #                                      prev_output[:, prev_offset1:prev_offset2])
+        #     loss += regularization_loss
+        loss.backward()
 
         if self.mas_coef > 0:
             for ln in self.net._modules.values():
@@ -227,8 +255,6 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
                     p.grad += self.mas_coef * hessian
 
         self.opt.step()
-
-        torch.cuda.empty_cache()
 
     def compute_importance(self):
         importances = []
@@ -244,7 +270,7 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         ce_loss = self.ce(outputs, targets)
         penalty = 0
         for param, importance in zip(self.parameters(), importances):
-            penalty += torch.norm(param) * importance
+            penalty += torch.norm(param) * importance  #'fro'
             #penalty += torch.norm(param) * importance
         total_loss = ce_loss + alpha * penalty
         return total_loss
@@ -275,7 +301,8 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
                 t)  # 将新任务添加到observed_tasks列表中   先判断新任务t是否与上一个任务（old_task）相同，如果不同则将t添加到observed_tasks中，并更新old_task为t。
             self.old_task = t  # 更新old_task
             # initialize episodic memory for the new task  #  为新任务初始化记忆体
-            self.memory_data[t] = torch.FloatTensor(bsz, self.n_inputs)  # 分别为新任务t分配一些空间，包括FloatTensor类型的memory_data（用于存储样本特征）、LongTensor类型的memory_labs（用于存储样本标签）以及一个大小为bsz的数组pxl_needed（表示该任务需要的像素数）。
+            self.memory_data[t] = torch.FloatTensor(bsz,
+                                                    self.n_inputs)  # 分别为新任务t分配一些空间，包括FloatTensor类型的memory_data（用于存储样本特征）、LongTensor类型的memory_labs（用于存储样本标签）以及一个大小为bsz的数组pxl_needed（表示该任务需要的像素数）。
             self.memory_labs[t] = torch.LongTensor(bsz)
             self.pxl_needed[t] = np.zeros(bsz)
             if self.gpu:  # 如果使用GPU，则将数据和标签移到GPU上  如果使用GPU，则将memory_data和memory_labs移动到GPU上
@@ -333,10 +360,10 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         #                 self.pxl_needed[t][:] = 1
         #                 break
 
-        offset1, offset2 = compute_offsets(t, self.nc_per_task,self.is_cifar)  # 根据任务t、每个任务的类别数self.nc_per_task、是否CIFAR数据集self.is_cifar计算偏移量
-        #loss = self.ce(self.forward(x, t)[:, offset1: offset2], y - offset1)     #按照偏移量，将输入x送到网络中进行前向计算，计算损失loss
+        offset1, offset2 = compute_offsets(t, self.nc_per_task,
+                                           self.is_cifar)  # 根据任务t、每个任务的类别数self.nc_per_task、是否CIFAR数据集self.is_cifar计算偏移量
+        # loss = self.ce(self.forward(x, t)[:, offset1: offset2], y - offset1)     #按照偏移量，将输入x送到网络中进行前向计算，计算损失loss
 
-###########################
         importances = self.compute_importance()
         loss = self.loss_with_importance(self.forward(x, t)[:, offset1:offset2], y - offset1, importances)
 
@@ -350,7 +377,7 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         # reg_loss = None
 
 
-#******************************************
+
         reg_loss = 0.0
         for param in self.parameters():
             if reg_loss is None:
@@ -358,7 +385,6 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
             else:
                 reg_loss += torch.norm(param, p='fro')
         loss += 0.02 * reg_loss # 将正则化损失添加到总体损失中
-        #loss = 0.02 * reg_loss
 
 
 
@@ -431,8 +457,8 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
             # get GradCAM mask by threshold theta  #  根据阈值theta获取GradCAM掩码
             mask = np.where(tmp_gc < self.theta, 1, 0)
             # calculate number of non-zero pixels of this image after applying the mask  计算应用掩码后该图像中非零像素的数量
-            pxl_needed[i] = 3 * 32 * 32 - 3 * np.count_nonzero(mask)
-            #pxl_needed[i] = 3 * 84 * 84 - 3 * np.count_nonzero(mask)
+            #pxl_needed[i] = 3 * 32 * 32 - 3 * np.count_nonzero(mask)
+            pxl_needed[i] = 3 * 84 * 84 - 3 * np.count_nonzero(mask)
             # mask the image 应用掩码到图像上
             mask = np.uint8(mask)  # 将掩码应用到图像上
             tmp_inpainted = cv2.inpaint(tmp_x, mask, 3, cv2.INPAINT_TELEA)  # 使用  cv2.inpaint  创建掩膜图像

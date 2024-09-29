@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,7 +6,7 @@ import numpy as np
 import cv2
 import quadprog
 from utils import *
-from sklearn import svm
+
 from model.common import MLP, ResNet18  # 导入自己创建的MLP和ResNet18模型
 
 # Import GradCAM class  #  导入GradCAM类
@@ -97,11 +96,6 @@ def project2cone2(gradient, memories, margin=0.5, eps=1e-3):  # 定义了一个�
     gradient.copy_(torch.Tensor(x).view(-1, 1))  # 将x转换为Tensor，并使用其更新原有梯度张量
 
 
-
-
-
-
-
 class Net(nn.Module):  # 定义了一个神经网络的类Net
     def __init__(self,
                  n_inputs,
@@ -112,16 +106,15 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         super(Net, self).__init__()
         nl, nh = args.n_layers, args.n_hiddens
         self.margin = args.memory_strength  # 设定记忆强度，即存储新数据的程度
-        self.data_file = args.data_file
-        self.is_cifar = (args.data_file == 'cifar100.pt' or args.data_file == "cifar10.pt" or "mini_imagenet" in args.data_file)
-        #self.is_cifar = (args.data_file == 'cifar10.pt')  # 判断是否为cifar100数据集
+        self.is_cifar = (args.data_file == 'cifar10.pt')  # 判断是否为cifar100数据集
         self.mas_coef = mas_coef  # 添加新的超参数 mas_coef
         self.l2_coef = l2_coef
         self.state = {}  # 添加存储模型参数状态的字典
         if self.is_cifar:  # 如果是cifar100数据集
-            self.net = ResNet18(n_outputs,args.data_file)  # 神经网络为ResNet18    ********
+            self.net = ResNet18(n_outputs)  # 神经网络为ResNet18    ********
             self.target_layer = self.net.layer4[-1]  # 设定目标层，即最后一层
-            self.cam = GradCAM(model=self.net, target_layer=self.target_layer,use_cuda=True)  # 实例化GradCAM，使用cuda  **********
+            self.cam = GradCAM(model=self.net, target_layer=self.target_layer,
+                               use_cuda=True)  # 实例化GradCAM，使用cuda  **********
         else:  # 如果不是cifar100数据集
             self.net = MLP([n_inputs] + [nh] * nl + [n_outputs])  # 神经网络为MLP  ********
         #  以上为初始化神经网络所需运行的代码
@@ -173,48 +166,50 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         self.pxl_stored = np.zeros(n_tasks)  # 初始化存储的像素
         self.img_stored = np.zeros(n_tasks)  # 初始化存储的图像像素
 
-        # # MAS相关代码，用于提取Memory重要参数
-        # self.omega = []
-        # for param in self.parameters():
-        #     self.omega.append(torch.zeros_like(param.data, requires_grad=False))
-        # self.prev_param = None
-        self.pt_output = None
-        # self.offset1 = None
-        # self.offset2 = None
-        self.pt_loss = None
+        # MAS相关代码，用于提取Memory重要参数
+        self.omega = []
+        for param in self.parameters():
+            self.omega.append(torch.zeros_like(param.data, requires_grad=False))
+        self.prev_param = None
 
-
-
+    # *************************************
+    # def compute_importance(self, x, t):
+    #     bs = x.size(0)
+    #     importance = []
+    #     for param in self.parameters():
+    #         importance.append(torch.zeros_like(param))
+    #     losses = torch.zeros(bs)
+    #
+    #     for i in range(bs):
+    #         output = self.net(x[i].unsqueeze(0))
+    #         offset1, offset2 = compute_offsets(t, self.nc_per_task, self.is_cifar)
+    #         t_tensor = torch.tensor(t)
+    #         loss = self.ce(output[:, offset1:offset2], t_tensor)
+    #         #loss = self.ce(output[:, offset1:offset2], t)
+    #         losses[i] = loss.item()
+    #         loss.backward()
+    #         for j, param in enumerate(self.parameters()):
+    #             importance[j] += torch.abs(param.grad.data)
+    #
+    #     total_loss = torch.sum(losses)
+    #     for j, param in enumerate(self.parameters()):
+    #         importance[j] *= losses / total_loss
+    #
+    #     return importance
 
     def update_parameters(self, x, t, y):
-
         self.zero_grad()
+        output = self.net(x)
         offset1, offset2 = compute_offsets(t, self.nc_per_task, self.is_cifar)
-        current_task_loss = self.ce(self.forward(x, t)[:, offset1:offset2], y - offset1)
-        loss_update = self.ce(self.net(x)[:, offset1:offset2], y - offset1)    #优化损失  适配损失suitabilityloss
+        loss = self.ce(output[:, offset1:offset2], y - offset1)
 
-        regularization_loss = 0 #任务记忆损失   task memory loss
-        dist_loss = 0  #任务分布对齐损失  alignment loss
-
-        # compute gradient on previous tasks      #  计算前一个任务的梯度
-        if len(self.observed_tasks) > 1:  # 代码首先判断模型已经观察到的任务数量是否大于1，如果是则进入for循环。
-
-            for tt in range(len(self.observed_tasks) - 1):
-                past_task = self.observed_tasks[tt]
-                offset1, offset2 = compute_offsets(past_task, self.nc_per_task, self.is_cifar)
-                pt_output = self.forward(self.memory_data[past_task], past_task)[:, offset1:offset2]
-                pt_loss = self.ce(pt_output, self.memory_labs[past_task] - offset1)
-                regularization_loss += pt_loss
-
-                #logits = pt_output
-                probs = F.softmax(pt_output, dim=1)
-                avg_probs = torch.mean(probs, dim=0)
-                uniform_dist = torch.ones_like(avg_probs) / (offset2 - offset1)
-                dist_loss += F.kl_div(torch.log(avg_probs), uniform_dist)
-            regularization_loss /= (len(self.observed_tasks) - 1)
-
-        total_loss = current_task_loss + 0.3 * regularization_loss + loss_update + dist_loss #
-        total_loss.backward()
+        if t > 0:
+            prev_output = self.forward(x, t - 1)
+            prev_offset1, prev_offset2 = compute_offsets(t - 1, self.nc_per_task, self.is_cifar)
+            regularization_loss = F.mse_loss(output[:, prev_offset1:prev_offset2],
+                                             prev_output[:, prev_offset1:prev_offset2])
+            loss += regularization_loss
+        loss.backward()
 
         if self.mas_coef > 0:
             for ln in self.net._modules.values():
@@ -228,8 +223,6 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
 
         self.opt.step()
 
-        torch.cuda.empty_cache()
-
     def compute_importance(self):
         importances = []
         for param in self.parameters():
@@ -237,7 +230,6 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
             importances.append(importance.item())
         max_importance = max(importances)
         importances = [importance / max_importance for importance in importances]
-        #print('importances:', importances)
         return importances
 
     def loss_with_importance(self, outputs, targets, importances, alpha=0.1):
@@ -245,7 +237,6 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         penalty = 0
         for param, importance in zip(self.parameters(), importances):
             penalty += torch.norm(param) * importance
-            #penalty += torch.norm(param) * importance
         total_loss = ce_loss + alpha * penalty
         return total_loss
 
@@ -275,20 +266,21 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
                 t)  # 将新任务添加到observed_tasks列表中   先判断新任务t是否与上一个任务（old_task）相同，如果不同则将t添加到observed_tasks中，并更新old_task为t。
             self.old_task = t  # 更新old_task
             # initialize episodic memory for the new task  #  为新任务初始化记忆体
-            self.memory_data[t] = torch.FloatTensor(bsz, self.n_inputs)  # 分别为新任务t分配一些空间，包括FloatTensor类型的memory_data（用于存储样本特征）、LongTensor类型的memory_labs（用于存储样本标签）以及一个大小为bsz的数组pxl_needed（表示该任务需要的像素数）。
+            self.memory_data[t] = torch.FloatTensor(bsz,
+                                                    self.n_inputs)  # 分别为新任务t分配一些空间，包括FloatTensor类型的memory_data（用于存储样本特征）、LongTensor类型的memory_labs（用于存储样本标签）以及一个大小为bsz的数组pxl_needed（表示该任务需要的像素数）。
             self.memory_labs[t] = torch.LongTensor(bsz)
             self.pxl_needed[t] = np.zeros(bsz)
             if self.gpu:  # 如果使用GPU，则将数据和标签移到GPU上  如果使用GPU，则将memory_data和memory_labs移动到GPU上
                 self.memory_data[t].cuda()
                 self.memory_labs[t].cuda()
 
-            # total_importance = np.zeros(len(self.omega))
-            #
-            # # for i in range(self.n_inputs):
-            # for i in range(len(self.omega)):
-            #     total_importance[i] += np.sum(self.omega[i].cpu().data.numpy())
-            # total_importance /= np.sum(total_importance)
-            # print('total importance:', total_importance)
+            total_importance = np.zeros(len(self.omega))
+
+            # for i in range(self.n_inputs):
+            for i in range(len(self.omega)):
+                total_importance[i] += np.sum(self.omega[i].cpu().data.numpy())
+            total_importance /= np.sum(total_importance)
+            print('total importance:', total_importance)
 
         # if self.mem_cnt > 0:
         #     self.project_importance(t, bsz)
@@ -307,39 +299,53 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
                     self.forward(
                         self.memory_data[past_task], past_task)[:, offset1: offset2],
                     self.memory_labs[past_task] - offset1)
-
                 ptloss.backward()  # 在反向传播中，代码将这个损失值反向传播回模型，并将梯度存储在grads列表中。  这样，代码就完成了对历史训练任务的反向传播，并将这些任务对应的梯度存储在grads列表中，以便后续在共享层中使用。#  将这个损失值反向传播回模型，并将梯度存储在  grads  列表中。
                 store_grad(self.parameters, self.grads, self.grad_dims,
                            past_task)  # store_grad  函数能够将参数和梯度大小存储到  grads  列表中。
 
         self.update_parameters(x, t, y)
 
-
-
-        # if t not in self.memory_data:
-        #     inputs_cpu = x.detach().clone().cpu()
-        #     labs_cpu = y.detach().clone().cpu() - compute_offsets(t, self.nc_per_task, self.is_cifar)[0]
-        #     self.img_stored[t] += inputs_cpu.size(0)
-        #     amount_to_save = min(inputs_cpu.size(0), int(self.max_pxl / self.n_inputs))
+        # # 调用 compute_importance 方法
+        # importance = self.compute_importance(x, t)
+        # print(importance)  # 打印重要性计算结果
         #
-        #     for i in range(inputs_cpu.size(0)):
-        #         if self.pxl_needed[t][i] == 0:
-        #             img = inputs_cpu[i].view(-1).numpy()
-        #             self.memory_data[t][self.pxl_stored[t]] = torch.from_numpy(img)
-        #             self.memory_labs[t][self.pxl_stored[t]] = labs_cpu[i]
-        #             self.pxl_stored[t] += 1
+        # # 调用 parameter_norm_penalty 方法
+        # penalty = self.parameter_norm_penalty()
+
         #
-        #             if self.pxl_stored[t] >= self.max_pxl / self.n_inputs:
-        #                 self.pxl_needed[t][:] = 1
-        #                 break
+        # # self.project_importance(task=t, mem_batch_size=256)
 
-        offset1, offset2 = compute_offsets(t, self.nc_per_task,self.is_cifar)  # 根据任务t、每个任务的类别数self.nc_per_task、是否CIFAR数据集self.is_cifar计算偏移量
-        #loss = self.ce(self.forward(x, t)[:, offset1: offset2], y - offset1)     #按照偏移量，将输入x送到网络中进行前向计算，计算损失loss
+        # now compute the grad on the current minibatch
+        # self.zero_grad() #  设置所有梯度为0
 
-###########################
+        # logits = self.forward(x, t)
+        # loss = self.ce(logits, y)
+        # loss.backward()
+        # store_grad(self.parameters, self.grads, self.grad_dims, t)
+
+        if t not in self.memory_data:
+            inputs_cpu = x.detach().clone().cpu()
+            labs_cpu = y.detach().clone().cpu() - compute_offsets(t, self.nc_per_task, self.is_cifar)[0]
+            self.img_stored[t] += inputs_cpu.size(0)
+            amount_to_save = min(inputs_cpu.size(0), int(self.max_pxl / self.n_inputs))
+
+            for i in range(inputs_cpu.size(0)):
+                if self.pxl_needed[t][i] == 0:
+                    img = inputs_cpu[i].view(-1).numpy()
+                    self.memory_data[t][self.pxl_stored[t]] = torch.from_numpy(img)
+                    self.memory_labs[t][self.pxl_stored[t]] = labs_cpu[i]
+                    self.pxl_stored[t] += 1
+
+                    if self.pxl_stored[t] >= self.max_pxl / self.n_inputs:
+                        self.pxl_needed[t][:] = 1
+                        break
+
+        offset1, offset2 = compute_offsets(t, self.nc_per_task,
+                                           self.is_cifar)  # 根据任务t、每个任务的类别数self.nc_per_task、是否CIFAR数据集self.is_cifar计算偏移量
+        # loss = self.ce(self.forward(x, t)[:, offset1: offset2], y - offset1)     #按照偏移量，将输入x送到网络中进行前向计算，计算损失loss
+
         importances = self.compute_importance()
         loss = self.loss_with_importance(self.forward(x, t)[:, offset1:offset2], y - offset1, importances)
-
         # l2_loss = 0.0
         # for param in self.parameters():
         #     l2_loss += torch.norm(param)
@@ -348,19 +354,14 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
         # loss.backward()   #  对损失进行反向传播，计算梯度
         # 计算参数范数惩罚（权重衰减）
         # reg_loss = None
-
-
-#******************************************
         reg_loss = 0.0
         for param in self.parameters():
             if reg_loss is None:
                 reg_loss = torch.norm(param, p='fro')  # 使用Frobenius范数作为正则化项
             else:
                 reg_loss += torch.norm(param, p='fro')
-        loss += 0.02 * reg_loss # 将正则化损失添加到总体损失中
-        #loss = 0.02 * reg_loss
-
-
+        loss += 0.02 * reg_loss  # 将正则化损失添加到总体损失中
+        loss_channels = []
 
         loss.backward()
 
@@ -393,33 +394,31 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
                 # copy gradients back        #  将梯度复制回去
                 overwrite_grad(self.parameters, self.grads[:, t], self.grad_dims)
 
-                # # MAS相关代码，更新重要度参数
-                # param_list = list(self.parameters())
-                # if self.prev_param is None:
-                #     self.prev_param = []
-                #     for param, omega in zip(param_list, self.omega):
-                #         self.prev_param.append(param.data.clone())
-                #         omega += torch.abs(param.grad.data)
-                # else:
-                #     for param, omega, prev_param in zip(param_list, self.omega, self.prev_param):
-                #         omega += torch.abs(param.grad.data * (param.data - prev_param))
-                #         prev_param.copy_(param.data)
+                # MAS相关代码，更新重要度参数
+                param_list = list(self.parameters())
+                if self.prev_param is None:
+                    self.prev_param = []
+                    for param, omega in zip(param_list, self.omega):
+                        self.prev_param.append(param.data.clone())
+                        omega += torch.abs(param.grad.data)
+                else:
+                    for param, omega, prev_param in zip(param_list, self.omega, self.prev_param):
+                        omega += torch.abs(param.grad.data * (param.data - prev_param))
+                        prev_param.copy_(param.data)
         self.opt.step()  # 执行优化器的反向传播
 
         # Update ring buffer storing examples from current task with memory efficiency by GradCAM  使用  GradCAM  更新存储当前任务示例的环形缓冲区，以达到节省内存的效果
         tmp_x_data = x.data  # tensor shape: bsz by 3*32*32  获取输入  tensor，该  tensor  的形状为  bsz*3*32*32
-        #tmp_x_data = tmp_x_data.view(tmp_x_data.size(0), 3, 32,32)  # convert the shape to be 4D  #  将  tensor  的形状转换为  4D
-        if "cifar" in self.data_file:
-            tmp_x_data = tmp_x_data.view(tmp_x_data.size(0),3,32,32) # convert the shape to be 4D
-        else:
-            tmp_x_data = tmp_x_data.view(tmp_x_data.size(0),3,84,84)
+        tmp_x_data = tmp_x_data.view(tmp_x_data.size(0), 3, 32,
+                                     32)  # convert the shape to be 4D  #  将  tensor  的形状转换为  4D
         original_x = tmp_x_data.clone()  # 克隆一个新的  tensor，并将其转换为  np.float32  类型
         original_x = np.float32(original_x.detach().cpu())
 
         target_category = None  # y.detach().cpu().tolist()#  目标类别设为  None
         grayscale_cam = self.cam(input_tensor=tmp_x_data, target_category=target_category, task_index=t)  # 计算  GradCAM
         masked_x = torch.empty_like(tmp_x_data)  # 生成一个空的  torch  tensor  用于存储掩码图像
-        pxl_needed = np.zeros(bsz)  # number of non-zero pixels for each image within this mini-batch  #  为这个  mini-batch  中的每个图像计算非零像素的数量
+        pxl_needed = np.zeros(
+            bsz)  # number of non-zero pixels for each image within this mini-batch  #  为这个  mini-batch  中的每个图像计算非零像素的数量
 
         tmp_x_data = tmp_x_data * 255.0  # convert image back to 0 - 255 value range将图像重新转换为0-255的数值范围
         for i in range(bsz):
@@ -432,7 +431,6 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
             mask = np.where(tmp_gc < self.theta, 1, 0)
             # calculate number of non-zero pixels of this image after applying the mask  计算应用掩码后该图像中非零像素的数量
             pxl_needed[i] = 3 * 32 * 32 - 3 * np.count_nonzero(mask)
-            #pxl_needed[i] = 3 * 84 * 84 - 3 * np.count_nonzero(mask)
             # mask the image 应用掩码到图像上
             mask = np.uint8(mask)  # 将掩码应用到图像上
             tmp_inpainted = cv2.inpaint(tmp_x, mask, 3, cv2.INPAINT_TELEA)  # 使用  cv2.inpaint  创建掩膜图像
@@ -455,11 +453,13 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
             self.pxl_needed[t] = pxl_needed  # 更新该时刻的像素需求量
 
         elif self.pxl_stored[t] + total_pxl_needed <= self.max_pxl:  # 如果该时刻的像素存储量加上当前mini-batch的像素需求量不超过最大像素存储量
-            self.memory_data[t] = torch.cat((self.memory_data[t].cuda(), masked_x), 0)  # 将当前mini-batch的masked_x合并到memory_data[t]
+            self.memory_data[t] = torch.cat((self.memory_data[t].cuda(), masked_x),
+                                            0)  # 将当前mini-batch的masked_x合并到memory_data[t]
             self.img_stored[t] += bsz  # 更新该时刻的图像存储量
             self.pxl_stored[t] += total_pxl_needed  # 更新该时刻所需像素总数
             self.memory_labs[t] = torch.cat((self.memory_labs[t].cuda(), y))  # 将当前mini-batch的y合并到memory_labs[t]
-            self.pxl_needed[t] = np.concatenate((self.pxl_needed[t], pxl_needed), axis=None)  # 将当前mini-batch的像素需求量合并到pxl_needed[t]
+            self.pxl_needed[t] = np.concatenate((self.pxl_needed[t], pxl_needed),
+                                                axis=None)  # 将当前mini-batch的像素需求量合并到pxl_needed[t]
 
         else:  # 如果该时刻的像素存储量加上当前mini-batch的像素需求量超过最大像素存储量
             pxl_released = 0
@@ -478,7 +478,8 @@ class Net(nn.Module):  # 定义了一个神经网络的类Net
                     self.img_stored[t] += bsz  # 更新该时刻的图像存储量
                     self.pxl_stored[t] += total_pxl_needed  # 更新该时刻的像素存储量
                     self.memory_labs[t] = torch.cat((self.memory_labs[t].cuda(), y))  # 将当前mini-batch的y合并到memory_labs[t]
-                    self.pxl_needed[t] = np.concatenate((self.pxl_needed[t], pxl_needed), axis=None)  # 将当前mini-batch的像素需求量合并到pxl_needed[t]
+                    self.pxl_needed[t] = np.concatenate((self.pxl_needed[t], pxl_needed),
+                                                        axis=None)  # 将当前mini-batch的像素需求量合并到pxl_needed[t]
                     break
                 else:
                     continue
