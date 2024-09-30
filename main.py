@@ -189,7 +189,7 @@ if __name__ == "__main__":
 
     # parameters specific to models in https://openreview.net/pdf?id=B1gTShAct7 
     
-    parser.add_argument('--memories', type=int, default=5120, help='number of total memories stored in a reservoir sampling based buffer')
+    parser.add_argument('--memories', type=int, default=5000, help='number of total memories stored in a reservoir sampling based buffer')
 
     parser.add_argument('--gamma', type=float, default=1.0,
                         help='gamma learning rate parameter') #gating net lr in roe 
